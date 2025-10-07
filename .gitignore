@@ -1,0 +1,6 @@
+*.pyc
+__pycache__/
+.env
+strategies/*.py
+!strategies/example_*.py
+*.log

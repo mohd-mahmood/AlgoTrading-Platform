@@ -802,6 +802,8 @@ def open_browser():
 
 
 if __name__ == '__main__':
+    import os
+    
     # Create directories
     os.makedirs('strategies', exist_ok=True)
     os.makedirs('static', exist_ok=True)
@@ -812,52 +814,14 @@ if __name__ == '__main__':
     
     # Print banner
     print("\n" + "=" * 70)
-    print("           🚀 ALGOTRADING PLATFORM - INTEGRATED VERSION")
+    print("      🚀 ALGOTRADING PLATFORM - DEPLOYED VERSION")
     print("=" * 70)
-    print("\n📋 Features:")
-    print("   ✅ Paper Trading (simulated orders with live data)")
-    print("   ✅ Live Trading (real orders on Dhan broker)")
-    print("   ✅ Backtesting (test on historical AngelOne data)")
-    print("   ✅ Real-time Market Data (AngelOne MarketFeed)")
-    print("   ✅ Custom Python Strategies (bring your own)")
-    print("\n🔧 Data Provider: AngelOne (MarketFeed + Historical API)")
-    print("🔧 Execution Broker: Dhan (live orders only)")
     
-    # Check dependencies
-    print("\n🔍 Checking dependencies...")
-    if ANGELONE_AVAILABLE:
-        print("   ✅ SmartApi (AngelOne) installed")
-    else:
-        print("   ❌ SmartApi not installed - Run: pip install smartapi-python")
+    # Get port from environment (Railway provides this)
+    port = int(os.environ.get('PORT', 5000))
     
-    if DHAN_AVAILABLE:
-        print("   ✅ DhanHQ installed")
-    else:
-        print("   ❌ DhanHQ not installed - Run: pip install dhanhq")
-    
-    print("\n" + "=" * 70)
-    print("🌐 Server starting on: http://localhost:5000")
+    print(f"\n🌐 Server starting on port: {port}")
     print("=" * 70)
-    print("\n📖 Quick Start:")
-    print("   1. Browser will open automatically")
-    print("   2. Click Settings ⚙️ to configure AngelOne & Dhan APIs")
-    print("   3. Upload your Python strategy (.py file)")
-    print("   4. Select mode: Paper/Backtest/Live")
-    print("   5. Click 'Start Trading'")
-    print("\n⚠️  IMPORTANT:")
-    print("   - Test in PAPER mode first!")
-    print("   - Live mode uses real money on Dhan")
-    print("   - Keep API credentials secure")
-    print("\n💡 Place your strategy files in: ./strategies/")
-    print("=" * 70)
-    print("\n⏳ Starting server...\n")
     
-    # Open browser in background thread
-    threading.Thread(target=open_browser, daemon=True).start()
-    
-    # Run the app
-    try:
-        socketio.run(app, host='0.0.0.0', port=5000, debug=False, allow_unsafe_werkzeug=True)
-    except KeyboardInterrupt:
-        print("\n\n👋 Shutting down AlgoTrading Platform...")
-        print("=" * 70)
+    # Run the app (no browser opening in production)
+    socketio.run(app, host='0.0.0.0', port=port, debug=False, allow_unsafe_werkzeug=True)
