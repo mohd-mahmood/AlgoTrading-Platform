@@ -45,13 +45,15 @@ trading_state = {
     'pnl': {'realized': 0, 'unrealized': 0, 'total': 0},
     'market_data': {},
     'strategy': None,
-    'subscribed_symbols': []
+    'subscribed_symbols': [],
+    'instrument_map': {}
 }
 
 # API clients
 angel_client = None
 dhan_client = None
 ws_client = None
+ltp_thread = None
 
 
 class StrategyRunner:
@@ -103,8 +105,10 @@ class TradingContext:
         
         if trading_state['mode'] == 'live' and dhan_client and DHAN_AVAILABLE:
             try:
+                # Resolve Dhan security id from cache or API
+                security_id = get_dhan_security_id(symbol) if 'get_dhan_security_id' in globals() else symbol
                 response = dhan_client.place_order(
-                    security_id=symbol,
+                    security_id=security_id,
                     exchange_segment=dhan_client.NSE,
                     transaction_type=dhan_client.BUY if side == 'BUY' else dhan_client.SELL,
                     quantity=quantity,
@@ -144,10 +148,19 @@ class TradingContext:
 
 def on_tick(ws, tick):
     try:
+        # SmartWebSocketV2 delivers list of dicts; map by token
         for token_data in tick:
-            symbol = token_data.get('name', '')
+            token = str(token_data.get('token') or token_data.get('symbol_token') or '')
+            # Find symbol by token
+            symbol = None
+            for sym, info in trading_state.get('instrument_map', {}).items():
+                if str(info.get('symboltoken')) == token:
+                    symbol = sym
+                    break
+            if not symbol:
+                symbol = token_data.get('name') or token
             trading_state['market_data'][symbol] = {
-                'ltp': token_data.get('last_traded_price', 0) / 100,
+                'ltp': (token_data.get('last_traded_price') or token_data.get('ltp') or 0) / 100 if token_data.get('last_traded_price') else float(token_data.get('ltp') or 0),
                 'volume': token_data.get('volume_trade_for_the_day', 0),
                 'timestamp': datetime.now().isoformat()
             }
@@ -172,6 +185,141 @@ def on_close(ws):
 
 def on_error(ws, error):
     log_message(f"WebSocket error: {str(error)}", 'error')
+
+
+# -----------------------------
+# Market data + instruments
+# -----------------------------
+
+def resolve_with_angelone(symbol: str):
+    """Resolve symbol to AngelOne token + tradingsymbol using Smart API search."""
+    if not ANGELONE_AVAILABLE or angel_client is None:
+        return None
+    try:
+        payload_candidates = [
+            { 'exchange': 'NSE', 'search': symbol },
+            { 'exchange': 'NSE', 'searchScrip': symbol },
+            { 'search': symbol }
+        ]
+        result = None
+        for payload in payload_candidates:
+            try:
+                result = angel_client.searchScrip(payload)
+                if result and 'data' in result and result['data']:
+                    break
+            except Exception:
+                continue
+        if not result or 'data' not in result or not result['data']:
+            return None
+        top = result['data'][0]
+        return {
+            'exchange': 'NSE',
+            'symboltoken': str(top.get('symboltoken') or top.get('symbolToken') or ''),
+            'tradingsymbol': top.get('tradingsymbol') or top.get('tradingsymbolName') or symbol,
+            'name': top.get('name') or symbol
+        }
+    except Exception as e:
+        log_message(f"AngelOne search failed for {symbol}: {e}", 'error')
+        return None
+
+
+def try_dhan_search(symbol: str):
+    """Best-effort search for Dhan security id using available client methods."""
+    if not DHAN_AVAILABLE or dhan_client is None:
+        return None
+    candidates = []
+    if hasattr(dhan_client, 'search_instruments'):
+        candidates.append(('search_instruments', {'exchange_segment': getattr(dhan_client, 'NSE', 'NSE'), 'search': symbol}))
+        candidates.append(('search_instruments', {'exchange_segment': 'NSE', 'search': symbol}))
+    if hasattr(dhan_client, 'search_instrument'):
+        candidates.append(('search_instrument', {'exchange_segment': getattr(dhan_client, 'NSE', 'NSE'), 'search': symbol}))
+        candidates.append(('search_instrument', {'exchange_segment': 'NSE', 'search': symbol}))
+        candidates.append(('search_instrument', {'exchange': 'NSE', 'search': symbol}))
+
+    for method_name, kwargs in candidates:
+        try:
+            method = getattr(dhan_client, method_name)
+            res = method(**kwargs)
+            if not res:
+                continue
+            data = res.get('data') if isinstance(res, dict) else res
+            if isinstance(data, list) and data:
+                item = data[0]
+            elif isinstance(data, dict) and data:
+                item = data
+            else:
+                continue
+            security_id = item.get('securityId') or item.get('security_id') or item.get('securityID')
+            if security_id:
+                return str(security_id)
+        except Exception:
+            continue
+    return None
+
+
+def get_dhan_security_id(symbol: str) -> str:
+    mapping = trading_state.get('instrument_map', {}).get(symbol)
+    if mapping and mapping.get('dhan_security_id'):
+        return mapping['dhan_security_id']
+
+    security_id = try_dhan_search(symbol)
+    if security_id:
+        trading_state['instrument_map'].setdefault(symbol, {})['dhan_security_id'] = security_id
+        return security_id
+    return symbol
+
+
+def poll_ltp_loop():
+    """Background loop to poll LTP via AngelOne REST for subscribed symbols."""
+    if not ANGELONE_AVAILABLE or angel_client is None:
+        log_message('AngelOne not configured; market data polling disabled', 'warning')
+        return
+    while trading_state['is_running'] and trading_state['mode'] != 'backtest':
+        try:
+            symbols = list(trading_state.get('subscribed_symbols') or [])
+            instrument_map = trading_state.get('instrument_map', {})
+            for symbol in symbols:
+                info = instrument_map.get(symbol) or resolve_with_angelone(symbol)
+                if not info or not info.get('symboltoken'):
+                    continue
+                try:
+                    ltp_resp = angel_client.getLTPData(
+                        exchange='NSE',
+                        tradingsymbol=info.get('tradingsymbol', symbol),
+                        symboltoken=info['symboltoken']
+                    )
+                    if ltp_resp and 'data' in ltp_resp and ltp_resp['data']:
+                        data = ltp_resp['data']
+                        trading_state['market_data'][symbol] = {
+                            'ltp': float(data.get('ltp') or data.get('last_price') or 0),
+                            'volume': data.get('volume') or 0,
+                            'timestamp': datetime.now().isoformat()
+                        }
+                except Exception:
+                    continue
+            socketio.emit('market_data', trading_state['market_data'])
+        except Exception as e:
+            log_message(f"LTP polling error: {e}", 'error')
+        import time
+        time.sleep(1)
+
+
+def ensure_instruments(symbols):
+    """Resolve and cache instrument info for symbols using AngelOne and Dhan."""
+    for raw in symbols:
+        symbol = raw.strip().upper()
+        if not symbol:
+            continue
+        mapping = trading_state['instrument_map'].get(symbol, {})
+        if 'symboltoken' not in mapping:
+            ang = resolve_with_angelone(symbol)
+            if ang:
+                mapping.update(ang)
+        if 'dhan_security_id' not in mapping:
+            security_id = try_dhan_search(symbol)
+            if security_id:
+                mapping['dhan_security_id'] = security_id
+        trading_state['instrument_map'][symbol] = mapping
 
 
 # Create index.html file
@@ -231,6 +379,12 @@ def create_frontend_files():
                 this.render();
                 this.setupSocketListeners();
                 this.addLog('System initialized', 'success');
+                // Fetch status to display existing subscriptions
+                fetch('/api/status').then(r => r.json()).then(res => {
+                    if (res?.data?.subscriptions) {
+                        this.state.subscriptions = res.data.subscriptions;
+                    }
+                });
             },
 
             setupSocketListeners() {
@@ -519,6 +673,30 @@ def create_frontend_files():
                             </div>
                         </div>
 
+                        <!-- Market Data + Subscription -->
+                        <div class="bg-gray-800 rounded-lg p-6 shadow-xl mb-6">
+                            <h3 class="text-xl font-semibold mb-4">Market Data (AngelOne)</h3>
+                            <div class="flex gap-2 mb-4">
+                                <input id="symbols-input" type="text" placeholder="Symbols e.g. RELIANCE,TCS,INFY" class="flex-1 p-3 bg-gray-700 text-white rounded" />
+                                <button onclick="app.subscribeSymbols()" class="px-4 py-3 bg-blue-600 hover:bg-blue-700 rounded font-semibold">Subscribe</button>
+                            </div>
+                            <div class="overflow-x-auto">
+                                <table class="w-full">
+                                    <thead>
+                                        <tr class="text-left border-b border-gray-700">
+                                            <th class="pb-3 px-2">Symbol</th>
+                                            <th class="pb-3 px-2">LTP</th>
+                                            <th class="pb-3 px-2">Volume</th>
+                                            <th class="pb-3 px-2">Time</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody id="marketdata-tbody">
+                                        <tr><td colspan="4" class="py-6 text-center text-gray-500">No data</td></tr>
+                                    </tbody>
+                                </table>
+                            </div>
+                        </div>
+
                         <!-- Orders Table -->
                         <div class="bg-gray-800 rounded-lg p-6 shadow-xl mb-6">
                             <h3 class="text-xl font-semibold mb-4">Orders</h3>
@@ -686,6 +864,40 @@ def upload_strategy():
         return jsonify({'status': 'error', 'message': str(e)}), 400
 
 
+@app.route('/api/subscribe', methods=['POST'])
+def subscribe_symbols():
+    """Subscribe list of symbols for market data using AngelOne (and cache Dhan ids)."""
+    payload = request.json or {}
+    symbols = payload.get('symbols') or []
+    if not isinstance(symbols, list) or not symbols:
+        return jsonify({'status': 'error', 'message': 'symbols must be a non-empty list'}), 400
+    symbols = [str(s).strip().upper() for s in symbols if str(s).strip()]
+    trading_state['subscribed_symbols'] = symbols
+    try:
+        ensure_instruments(symbols)
+        # If websocket available, attempt to subscribe via token list
+        if ws_client and ANGELONE_AVAILABLE:
+            try:
+                token_list = []
+                for s in symbols:
+                    info = trading_state['instrument_map'].get(s)
+                    if not info or not info.get('symboltoken'):
+                        continue
+                    token_list.append({
+                        'exchangeType': 1,  # 1 => NSE CM in SmartAPI v2
+                        'tokens': [int(info['symboltoken'])]
+                    })
+                if hasattr(ws_client, 'subscribe'):  # SmartWebSocketV2
+                    ws_client.subscribe(token_list)
+            except Exception as e:
+                log_message(f"Websocket subscribe failed: {e}", 'warning')
+        # Start LTP polling thread if needed
+        _start_ltp_thread()
+        return jsonify({'status': 'success', 'symbols': symbols})
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 400
+
+
 @app.route('/api/trading/start', methods=['POST'])
 def start_trading():
     data = request.json
@@ -701,10 +913,22 @@ def start_trading():
         trading_state['is_running'] = True
         
         context = TradingContext()
-        trading_state['strategy'].initialize(context)
+        try:
+            trading_state['strategy'].initialize(context)
+        except Exception as e:
+            log_message(f"Strategy initialize error: {e}", 'error')
         
-        if ws_client and trading_state['mode'] != 'backtest':
-            ws_client.connect()
+        # Start AngelOne stream or fallback to REST LTP polling
+        if trading_state['mode'] != 'backtest':
+            if ws_client:
+                try:
+                    # Subscribe to instruments on connect if any
+                    ws_client.connect()
+                except Exception as e:
+                    log_message(f"Websocket connect failed; falling back to polling: {e}", 'warning')
+                    _start_ltp_thread()
+            else:
+                _start_ltp_thread()
         
         log_message(f"Trading started in {trading_state['mode']} mode", 'success')
         return jsonify({'status': 'success'})
@@ -724,6 +948,11 @@ def stop_trading():
             ws_client.close_connection()
         except:
             pass
+    global ltp_thread
+    try:
+        ltp_thread = None
+    except Exception:
+        pass
     
     log_message("Trading stopped", 'warning')
     return jsonify({'status': 'success'})
@@ -763,7 +992,8 @@ def get_status():
             'angelone_connected': angel_client is not None,
             'dhan_connected': dhan_client is not None,
             'orders_count': len(trading_state['orders']),
-            'positions_count': len(trading_state['positions'])
+            'positions_count': len(trading_state['positions']),
+            'subscriptions': trading_state['subscribed_symbols']
         }
     })
 
@@ -799,6 +1029,15 @@ def open_browser():
         webbrowser.open('http://localhost:5000')
     except:
         print("⚠️  Could not open browser automatically. Please open http://localhost:5000 manually")
+
+
+def _start_ltp_thread():
+    """Start background polling thread once."""
+    global ltp_thread
+    if ltp_thread is not None:
+        return
+    ltp_thread = threading.Thread(target=poll_ltp_loop, daemon=True)
+    ltp_thread.start()
 
 
 if __name__ == '__main__':
